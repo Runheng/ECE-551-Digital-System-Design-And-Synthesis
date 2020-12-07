@@ -1,0 +1,137 @@
+
+task init;
+  begin
+    send_cmd = 1'b0;
+    REF_CLK = 1'b0;
+    RST_n = 1'b0;
+    repeat (2) @(posedge REF_CLK);
+    @(negedge REF_CLK);				// on negedge REF_CLK after a few REF clocks
+    RST_n = 1'b1;				        // deasert reset
+    @(negedge REF_CLK);
+  end
+endtask
+
+// send out host commend
+task send_Cmd(input [15:0] given_cmd);
+    begin
+    host_cmd = given_cmd;
+    @(negedge clk);
+    send_cmd = 1'b1;
+    @(negedge clk);
+    send_cmd = 1'b0;
+  end
+endtask
+
+// After host commend is sent, wait for response
+task wait_Resp;
+  input integer time_bound;
+  begin
+    @(posedge cmd_sent);
+    @(posedge clk);
+    fork 
+      begin: TIMEOUT;
+        repeat(time_bound)@(negedge clk);
+        $display("ERR: timed out waiting for response");
+        $stop();
+      end
+      begin
+        @(posedge resp_rdy);
+        disable TIMEOUT;
+      end
+    join
+  end
+endtask
+
+// check if response received is expected
+task check_Resp(input [7:0] expected_resp);
+  begin
+    if(resp != expected_resp) begin
+      $display("ERR: response received is not expected");
+      $stop();
+    end
+  end
+endtask
+
+// check if capture is done
+task wait_cap_done;
+  begin
+    capture_done_bit = 1'b0; // capture_done not set yet
+    loop_cnt = 0;
+    // polling for capture_done
+    while(!capture_done_bit) begin
+      repeat(400)@(posedge clk);  // delay a while between reads
+      loop_cnt = loop_cnt + 1;
+      if (loop_cnt > 200) begin
+        $display("ERR: capture done bit never set");
+        $stop();
+      end
+      send_Cmd({TRIG_CFG_RD,8'h00});
+      wait_Resp(100000);
+      if(resp & 8'h20) begin
+        capture_done_bit = 1'b1;
+      end
+      clr_resp_rdy = 1'b1;
+      @(posedge clk);
+      clr_resp_rdy = 1'b0;
+    end
+    $display("INFO: capture_done bit is set");
+  end
+endtask
+
+// Collect dump into a file
+task collect_dump(input integer fptr, input [2:0] CHnum);
+  begin
+    // Now wait for command to be sent //
+    @(posedge cmd_sent);
+    @(posedge clk);
+    $display("dumping CH%d",CHnum);
+    for(sample = 0; sample <384; sample++)
+      fork
+        begin: TIMEOUT_dump
+          repeat(6000)@(posedge clk);
+          $display("ERR: timed out during dump, only received %d of 384 bytes", sample);
+          $stop();
+          sample = 384;  // break out of loop
+        end
+        begin
+          @(posedge resp_rdy);
+          disable TIMEOUT_dump;
+          $fdisplay(fptr, "%h", resp); // write to file
+          clr_resp_rdy = 1;
+          @(posedge clk);
+          clr_resp_rdy = 0;
+          if(sample%32 == 0)
+            $display("At sample %d of dump", sample);
+        end
+      join
+  end
+endtask
+
+// compare dump txt with expected value
+task compare_dump;
+  input integer fexp, fptr;
+  input [2:0] CHnum;
+  begin
+    found_res = $fscanf(fptr, "%h", res);
+    found_expected = $fscanf(fexp,"%h", exp);
+    $display("Starting comparison for CH %h", CHnum);
+    sample = 1;
+    mismatches = 0;
+    while(found_expected == 1)begin
+      if(res !== exp) begin
+        $display("At sample %d the result of %h does not match expected of %h",sample,res,exp);
+        mismatches = mismatches + 1;
+        if(mismatches > 150) begin
+          $display("Too many mismatches. Stop testing dump txt%h", CHnum);
+          $stop();
+        end
+      end
+      sample = sample +1;
+      found_res = $fscanf(fptr, "%h", res);
+      found_expected = $fscanf(fexp, "%h", exp);
+    end
+    $display("Comparison completed. Test dump CH%h passed!", CHnum);
+    $display("num mismatches in this test: %d", mismatches);
+  end
+endtask
+
